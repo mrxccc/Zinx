@@ -5,10 +5,15 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"zinx/utils"
 	"zinx/ziface"
 )
 
 type Connection struct {
+	//当前Conn属于哪个Server
+	TcpServer ziface.IServer //当前conn属于哪个server，在conn初始化的时候添加即可
+
 	//当前连接的socket TCP套接字
 	Conn *net.TCPConn
 
@@ -26,18 +31,29 @@ type Connection struct {
 
 	//无缓冲管道，用于读、写两个goroutine之间的消息通信
 	msgChan chan []byte
+
+	// ================================
+	//链接属性
+	property map[string]interface{}
+	//保护链接属性修改的锁
+	propertyLock sync.RWMutex
+	// ================================
 }
 
 //创建连接的方法
-func NewConntion(conn *net.TCPConn, connID uint32, msgHandler ziface.IMsgHandle) *Connection {
+func NewConntion(server ziface.IServer, conn *net.TCPConn, connID uint32, msgHandler ziface.IMsgHandle) *Connection {
 	c := &Connection{
+		TcpServer:    server, //将隶属的server传递进来
 		Conn:         conn,
 		ConnID:       connID,
 		isClosed:     false,
 		MsgHandler:   msgHandler,
 		ExitBuffChan: make(chan bool, 1),
-		msgChan:      make(chan []byte), //msgChan初始化
+		msgChan:      make(chan []byte),            //msgChan初始化
+		property:     make(map[string]interface{}), //对链接属性map初始化
 	}
+	//将新创建的Conn添加到链接管理中
+	c.TcpServer.GetConnMgr().Add(c) //将当前新创建的连接添加到ConnManager中
 	return c
 }
 
@@ -85,7 +101,13 @@ func (c *Connection) StartReader() {
 			msg:  msg, //将之前的buf 改成 msg
 		}
 		//从绑定好的消息和对应的处理方法中执行对应的Handle方法
-		go c.MsgHandler.DoMsgHandler(&req)
+		if utils.GlobalObject.WorkerPoolSize > 0 {
+			//已经启动工作池机制，将消息交给Worker处理
+			c.MsgHandler.SendMsgToTaskQueue(&req)
+		} else {
+			//从绑定好的消息和对应的处理方法中执行对应的Handle方法
+			go c.MsgHandler.DoMsgHandler(&req)
+		}
 	}
 }
 
@@ -139,6 +161,7 @@ func (c *Connection) Start() {
 	//2 开启用于写回客户端数据流程的Goroutine
 	go c.StartWriter()
 
+	c.TcpServer.CallOnConnStart(c)
 	for {
 		select {
 		case <-c.ExitBuffChan:
@@ -150,6 +173,7 @@ func (c *Connection) Start() {
 
 //停止连接，结束当前连接状态M
 func (c *Connection) Stop() {
+	fmt.Println("Conn Stop()...ConnID = ", c.ConnID)
 	//1. 如果当前链接已经关闭
 	if c.isClosed {
 		return
@@ -157,12 +181,16 @@ func (c *Connection) Stop() {
 	c.isClosed = true
 
 	//TODO Connection Stop() 如果用户注册了该链接的关闭回调业务，那么在此刻应该显示调用
+	c.TcpServer.CallOnConnStop(c)
 
 	// 关闭socket链接
 	c.Conn.Close()
 
 	//通知从缓冲队列读数据的业务，该链接已经关闭
 	c.ExitBuffChan <- true
+
+	//将链接从连接管理器中删除
+	c.TcpServer.GetConnMgr().Remove(c) //删除conn从ConnManager中
 
 	//关闭该链接全部管道
 	close(c.ExitBuffChan)
@@ -183,4 +211,32 @@ func (c *Connection) GetConnID() uint32 {
 //获取远程客户端地址信息
 func (c *Connection) RemoteAddr() net.Addr {
 	return c.Conn.RemoteAddr()
+}
+
+//设置链接属性
+func (c *Connection) SetProperty(key string, value interface{}) {
+	c.propertyLock.Lock()
+	defer c.propertyLock.Unlock()
+
+	c.property[key] = value
+}
+
+//获取链接属性
+func (c *Connection) GetProperty(key string) (interface{}, error) {
+	c.propertyLock.RLock()
+	defer c.propertyLock.RUnlock()
+
+	if value, ok := c.property[key]; ok {
+		return value, nil
+	} else {
+		return nil, errors.New("no property found")
+	}
+}
+
+//移除链接属性
+func (c *Connection) RemoveProperty(key string) {
+	c.propertyLock.Lock()
+	defer c.propertyLock.Unlock()
+
+	delete(c.property, key)
 }
